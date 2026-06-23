@@ -1,0 +1,21 @@
+---
+# =============================================================================
+#  Run Firecracker microVMs WITHOUT KVM / hardware virtualization, using PVM
+#  (Pagetable-based Virtual Machine) on a regular cloud VM.
+#
+#  Usage:
+#     ansible-playbook playbook.yml
+#     ansible-playbook playbook.yml -e pvm_reboot=false        # stage, don't reboot
+#     ansible-playbook playbook.yml -e pvm_run_smoke_test=false
+#     ansible-playbook playbook.yml --tags firecracker,host_kernel
+#
+#  NOTE: This compiles two Linux kernels and Firecracker from source. On a
+#  32-vCPU box budget ~20-40 min for a first run. It is safe to re-run: every
+#  expensive step is guarded with `creates:` and will be skipped if already done.
+# =============================================================================
+- name: Set up the no-KVM PVM Firecracker stack
+  hosts: pvm
+  become: true
+  gather_facts: true
+  roles:
+    - role: pvm_firecracker
