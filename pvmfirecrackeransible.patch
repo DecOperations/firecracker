@@ -1,0 +1,853 @@
+From 9e4522b3ae14ed29f3c383069da3344edbd17c06 Mon Sep 17 00:00:00 2001
+From: PVM Playbook <pvm@local>
+Date: Tue, 23 Jun 2026 15:20:46 +0800
+Subject: [PATCH] Add PVM Firecracker Ansible playbook (no-KVM microVMs)
+
+Adds an idempotent, role-based Ansible playbook that builds the entire
+no-KVM PVM Firecracker stack from a bare Rocky/Alma/RHEL 10 host:
+preflight (asserts x86_64 + RHEL + fsgsbase), packages, PVM-patched
+Firecracker, PVM host kernel, PVM guest kernel, Ubuntu rootfs, GRUB +
+reboot, and an end-to-end microVM smoke test.
+
+Usage:
+    cd pvm-firecracker-ansible
+    # edit inventory.ini -> your host
+    ansible-playbook playbook.yml
+---
+ pvm-firecracker-ansible/README.md             | 86 +++++++++++++++++++
+ pvm-firecracker-ansible/ansible.cfg           | 13 +++
+ pvm-firecracker-ansible/inventory.ini         | 10 +++
+ pvm-firecracker-ansible/playbook.yml          | 21 +++++
+ .../roles/pvm_firecracker/defaults/main.yml   | 41 +++++++++
+ .../roles/pvm_firecracker/handlers/main.yml   |  3 +
+ .../roles/pvm_firecracker/meta/main.yml       | 17 ++++
+ .../pvm_firecracker/tasks/00-preflight.yml    | 47 ++++++++++
+ .../pvm_firecracker/tasks/10-packages.yml     | 35 ++++++++
+ .../pvm_firecracker/tasks/20-firecracker.yml  | 69 +++++++++++++++
+ .../pvm_firecracker/tasks/30-host-kernel.yml  | 71 +++++++++++++++
+ .../pvm_firecracker/tasks/40-guest-kernel.yml | 48 +++++++++++
+ .../roles/pvm_firecracker/tasks/50-rootfs.yml | 28 ++++++
+ .../roles/pvm_firecracker/tasks/60-boot.yml   | 65 ++++++++++++++
+ .../pvm_firecracker/tasks/70-smoke-test.yml   | 43 ++++++++++
+ .../roles/pvm_firecracker/tasks/main.yml      | 25 ++++++
+ .../pvm_firecracker/templates/run-test.sh.j2  | 41 +++++++++
+ .../templates/vmconfig.json.j2                | 25 ++++++
+ 18 files changed, 688 insertions(+)
+ create mode 100644 pvm-firecracker-ansible/README.md
+ create mode 100644 pvm-firecracker-ansible/ansible.cfg
+ create mode 100644 pvm-firecracker-ansible/inventory.ini
+ create mode 100644 pvm-firecracker-ansible/playbook.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/defaults/main.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/handlers/main.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/meta/main.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/tasks/00-preflight.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/tasks/10-packages.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/tasks/20-firecracker.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/tasks/30-host-kernel.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/tasks/40-guest-kernel.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/tasks/50-rootfs.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/tasks/60-boot.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/tasks/70-smoke-test.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/tasks/main.yml
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/templates/run-test.sh.j2
+ create mode 100644 pvm-firecracker-ansible/roles/pvm_firecracker/templates/vmconfig.json.j2
+
+diff --git a/pvm-firecracker-ansible/README.md b/pvm-firecracker-ansible/README.md
+new file mode 100644
+index 0000000..81fba04
+--- /dev/null
++++ b/pvm-firecracker-ansible/README.md
+@@ -0,0 +1,86 @@
++# PVM Firecracker — Ansible playbook
++
++Run **Firecracker microVMs without KVM / hardware virtualization** on a regular
++cloud VM, using **PVM** (Pagetable-based Virtual Machine). This playbook codifies
++the whole manual build: a PVM-patched Firecracker, a PVM host kernel, a PVM guest
++kernel, an Ubuntu rootfs, GRUB config, reboot, and an end-to-end microVM smoke test.
++
++## The one hard requirement
++
++PVM needs the **`fsgsbase`** CPU feature exposed to the guest vCPU. Many cloud
++hosts hide it (for live-migration compatibility), and PVM **cannot** run there.
++Check first:
++
++```bash
++grep -o fsgsbase /proc/cpuinfo   # must print "fsgsbase"
++```
++
++The playbook asserts this in preflight and stops immediately if it's missing.
++
++Other requirements: x86_64, RHEL family (Rocky/Alma/RHEL **10** tested), root via SSH,
++~10 GB free disk, internet access. First run compiles two kernels + Firecracker
++(~20–40 min on 32 vCPUs).
++
++## Usage
++
++```bash
++# 1. point inventory.ini at your host
++# 2. run it
++ansible-playbook playbook.yml
++
++# stage everything but don't reboot / test (e.g. you want to control the reboot)
++ansible-playbook playbook.yml -e pvm_reboot=false -e pvm_run_smoke_test=false
++
++# re-run only part of it (every expensive step is idempotent via `creates:`)
++ansible-playbook playbook.yml --tags firecracker
++ansible-playbook playbook.yml --tags host_kernel,guest_kernel
++```
++
++## What it does (stages / tags)
++
++| Tag | Stage |
++|-----|-------|
++| `preflight`     | assert x86_64 + RHEL + **fsgsbase**, make work dirs |
++| `packages`      | install build + runtime dependencies |
++| `firecracker`   | install Rust, clone the fork, **re-apply the PVM source patches**, build, install `firecracker`/`jailer` |
++| `host_kernel`   | build + install the `pvm-612` host kernel (`CONFIG_KVM_PVM=m`, `pti=off` fixes) |
++| `guest_kernel`  | build the PVM guest `vmlinux` (stripped) |
++| `rootfs`        | build an Ubuntu ext4 rootfs with an injected SSH key |
++| `boot`          | `pti=off`, auto-load `kvm-pvm`, set default kernel, **reboot**, verify `/dev/kvm` |
++| `smoke_test`    | boot a microVM, ping + SSH into the guest, assert it's up |
++
++## Key variables (`roles/pvm_firecracker/defaults/main.yml`)
++
++| Variable | Default | Notes |
++|----------|---------|-------|
++| `pvm_reboot` | `true` | reboot into the PVM kernel and verify |
++| `pvm_set_default_kernel` | `true` | make the PVM kernel the persistent default |
++| `pvm_run_smoke_test` | `true` | boot a microVM and prove it |
++| `firecracker_repo` / `firecracker_version` | rusternetes-labs / `main` | patches re-applied regardless |
++| `pvm_linux_branch` | `pvm-612` | Linux 6.12.33 base |
++| `rootfs_squashfs_url` | FC CI Ubuntu 24.04 | userland is PVM-independent |
++| `make_jobs` | all vCPUs | parallel build |
++
++## Result
++
++After a successful run the target has, in `/root/pvm/`: `firecracker`, `jailer`,
++`vmlinux-pvm`, `rootfs.ext4`, `id_rsa`, `vmconfig.json`, `run-test.sh`. It boots the
++PVM kernel by default with `/dev/kvm` provided by `kvm-pvm`, and:
++
++```bash
++/root/pvm/run-test.sh   # boots a microVM (full Ubuntu guest) over PVM, no KVM hardware
++```
++
++## Notes & caveats
++
++- **Custom kernel + reboot.** Have console access to your cloud VM in case the
++  kernel fails to boot. `pvm_reboot=false` lets you stage everything and reboot
++  yourself. (`saved_entry` keeps your stock kernel as a fallback.)
++- **gnu build target.** Firecracker is built for `x86_64-unknown-linux-gnu`, which
++  uses an empty seccomp filter (no `libseccomp` at runtime). For a hardened
++  musl/static build, build via the upstream `tools/devtool` in a container.
++- **Idempotent.** Safe to re-run; finished steps are skipped. To force a kernel
++  rebuild, remove its `creates:` marker (e.g. the `bzImage`) or wipe `build_root`.
++- Live-migration support from the fork is intentionally out of scope (not needed
++  to run microVMs without KVM).
++```
+diff --git a/pvm-firecracker-ansible/ansible.cfg b/pvm-firecracker-ansible/ansible.cfg
+new file mode 100644
+index 0000000..81927a8
+--- /dev/null
++++ b/pvm-firecracker-ansible/ansible.cfg
+@@ -0,0 +1,13 @@
++[defaults]
++inventory = inventory.ini
++roles_path = roles
++host_key_checking = False
++retry_files_enabled = False
++stdout_callback = yaml
++# Kernel builds are long-running; keep the SSH connection alive.
++timeout = 60
++
++[ssh_connection]
++pipelining = True
++# Keep long-running tasks (kernel compiles) from dropping the control socket.
++ssh_args = -o ControlMaster=auto -o ControlPersist=120m -o ServerAliveInterval=30 -o ServerAliveCountMax=120
+diff --git a/pvm-firecracker-ansible/inventory.ini b/pvm-firecracker-ansible/inventory.ini
+new file mode 100644
+index 0000000..f336c67
+--- /dev/null
++++ b/pvm-firecracker-ansible/inventory.ini
+@@ -0,0 +1,10 @@
++# Target host(s) that will run the no-KVM PVM Firecracker stack.
++# Requirements: x86_64, a cloud VM whose vCPU EXPOSES the `fsgsbase` flag
++# (check with: grep -o fsgsbase /proc/cpuinfo). RHEL/Rocky/Alma 10 family.
++#
++# Example:
++[pvm]
++deployment ansible_host=170.106.40.67 ansible_user=root
++
++[pvm:vars]
++ansible_python_interpreter=/usr/bin/python3
+diff --git a/pvm-firecracker-ansible/playbook.yml b/pvm-firecracker-ansible/playbook.yml
+new file mode 100644
+index 0000000..2bf62a6
+--- /dev/null
++++ b/pvm-firecracker-ansible/playbook.yml
+@@ -0,0 +1,21 @@
++---
++# =============================================================================
++#  Run Firecracker microVMs WITHOUT KVM / hardware virtualization, using PVM
++#  (Pagetable-based Virtual Machine) on a regular cloud VM.
++#
++#  Usage:
++#     ansible-playbook playbook.yml
++#     ansible-playbook playbook.yml -e pvm_reboot=false        # stage, don't reboot
++#     ansible-playbook playbook.yml -e pvm_run_smoke_test=false
++#     ansible-playbook playbook.yml --tags firecracker,host_kernel
++#
++#  NOTE: This compiles two Linux kernels and Firecracker from source. On a
++#  32-vCPU box budget ~20-40 min for a first run. It is safe to re-run: every
++#  expensive step is guarded with `creates:` and will be skipped if already done.
++# =============================================================================
++- name: Set up the no-KVM PVM Firecracker stack
++  hosts: pvm
++  become: true
++  gather_facts: true
++  roles:
++    - role: pvm_firecracker
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/defaults/main.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/defaults/main.yml
+new file mode 100644
+index 0000000..b30989c
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/defaults/main.yml
+@@ -0,0 +1,41 @@
++---
++# ---------- Source repositories ----------
++# The Firecracker fork carrying the PVM forward-port (this role re-applies the
++# two essential source changes itself, so any reasonably-recent commit works).
++firecracker_repo: "https://github.com/rusternetes-labs/firecracker"
++firecracker_version: "main"
++
++# PVM host + guest kernel source (Linux 6.12.33 base).
++pvm_linux_repo: "https://github.com/virt-pvm/linux"
++pvm_linux_branch: "pvm-612"
++pvm_guest_config_url: "https://raw.githubusercontent.com/virt-pvm/misc/main/pvm-guest-6.12.33.config"
++
++# Ubuntu rootfs published by the Firecracker CI (userland is PVM-independent).
++rootfs_squashfs_url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/ubuntu-24.04.squashfs"
++rootfs_size: "1G"
++
++# ---------- Working directories ----------
++build_root: "/root/pvm-build"            # scratch space for clones + compiles
++host_kernel_src: "{{ build_root }}/host-linux"
++guest_kernel_src: "{{ build_root }}/guest-linux"
++firecracker_src: "{{ build_root }}/firecracker"
++pvm_dir: "/root/pvm"                      # runtime artifacts live here
++
++# ---------- Build knobs ----------
++make_jobs: "{{ ansible_processor_vcpus | default(ansible_processor_cores) | default(4) }}"
++host_localversion: "-pvm"                 # host kernel becomes 6.12.33-pvm+
++guest_localversion: "-pvmguest"
++fc_target: "x86_64-unknown-linux-gnu"     # gnu build => empty seccomp filter, no libseccomp at runtime
++
++# ---------- Behaviour toggles ----------
++pvm_reboot: true                          # reboot into the PVM kernel at the end
++pvm_set_default_kernel: true              # make the PVM kernel the persistent default
++pvm_run_smoke_test: true                  # boot a microVM and prove it after reboot
++
++# ---------- microVM smoke-test settings ----------
++vm_vcpus: 2
++vm_mem_mib: 1024
++vm_tap_dev: "tap0"
++vm_host_ip: "172.16.0.1"
++vm_guest_ip: "172.16.0.2"
++vm_guest_mac: "06:00:AC:10:00:02"         # derives 172.16.0.2 in the CI rootfs
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/handlers/main.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/handlers/main.yml
+new file mode 100644
+index 0000000..326c2df
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/handlers/main.yml
+@@ -0,0 +1,3 @@
++---
++# Reboot is handled inline in tasks/60-boot.yml (it must be followed by
++# verification tasks in the same play), so no handlers are required here.
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/meta/main.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/meta/main.yml
+new file mode 100644
+index 0000000..de0da1d
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/meta/main.yml
+@@ -0,0 +1,17 @@
++---
++galaxy_info:
++  role_name: pvm_firecracker
++  author: deployment
++  description: Run Firecracker microVMs without KVM using PVM on regular cloud VMs.
++  license: Apache-2.0
++  min_ansible_version: "2.14"
++  platforms:
++    - name: EL
++      versions:
++        - "10"
++  galaxy_tags:
++    - firecracker
++    - pvm
++    - virtualization
++    - microvm
++dependencies: []
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/00-preflight.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/00-preflight.yml
+new file mode 100644
+index 0000000..9dd5b0c
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/00-preflight.yml
+@@ -0,0 +1,47 @@
++---
++# PVM has hard requirements. Fail loudly NOW rather than after a 30-minute build.
++
++- name: Require x86_64
++  ansible.builtin.assert:
++    that: ansible_architecture == "x86_64"
++    fail_msg: "PVM is x86_64-only (found {{ ansible_architecture }})."
++
++- name: Require a RHEL-family distro (Rocky/Alma/RHEL 10 tested)
++  ansible.builtin.assert:
++    that: ansible_os_family == "RedHat"
++    fail_msg: "This role targets the RHEL family (found {{ ansible_distribution }})."
++
++- name: Read CPU flags
++  ansible.builtin.command: grep -m1 '^flags' /proc/cpuinfo
++  register: cpuflags
++  changed_when: false
++
++- name: >-
++    Require FSGSBASE (the show-stopper). PVM's kvm-pvm module refuses to load
++    without it, and a cloud host that hides it from guest CPUID cannot run PVM.
++  ansible.builtin.assert:
++    that: "'fsgsbase' in cpuflags.stdout"
++    fail_msg: >-
++      This VM's vCPU does NOT expose `fsgsbase`, so PVM cannot run here.
++      Move to an instance type / CPU model that exposes it
++      (verify with: grep -o fsgsbase /proc/cpuinfo).
++    success_msg: "FSGSBASE present — PVM is viable on this host."
++
++- name: Detect pre-existing /dev/kvm (real KVM present — PVM not strictly needed)
++  ansible.builtin.stat:
++    path: /dev/kvm
++  register: _preexisting_kvm
++
++- name: Note if hardware KVM is already available
++  ansible.builtin.debug:
++    msg: "Note: /dev/kvm already exists; this host may have real KVM and not need PVM."
++  when: _preexisting_kvm.stat.exists
++
++- name: Ensure working directories exist
++  ansible.builtin.file:
++    path: "{{ item }}"
++    state: directory
++    mode: "0755"
++  loop:
++    - "{{ build_root }}"
++    - "{{ pvm_dir }}"
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/10-packages.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/10-packages.yml
+new file mode 100644
+index 0000000..42a30fa
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/10-packages.yml
+@@ -0,0 +1,35 @@
++---
++- name: Install toolchain, kernel-build, Firecracker-build and rootfs dependencies
++  ansible.builtin.dnf:
++    name:
++      # base toolchain
++      - gcc
++      - gcc-c++
++      - make
++      - git
++      - perl
++      - python3
++      - curl
++      - wget
++      - xz
++      - rsync
++      - hostname
++      # kernel build
++      - bison
++      - flex
++      - openssl-devel
++      - elfutils-libelf-devel
++      - bc
++      - dwarves
++      - ncurses-devel
++      - dracut
++      # Firecracker build (aws-lc-sys/bindgen/seccompiler)
++      - cmake
++      - clang
++      - clang-devel
++      - libseccomp-devel
++      # rootfs + microVM networking
++      - squashfs-tools
++      - e2fsprogs
++      - iptables
++    state: present
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/20-firecracker.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/20-firecracker.yml
+new file mode 100644
+index 0000000..ef5eeca
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/20-firecracker.yml
+@@ -0,0 +1,69 @@
++---
++# Build the PVM-aware Firecracker. The fork's `main` tracks upstream and the
++# PVM source changes are tiny + surgical, so we re-apply them here idempotently
++# instead of depending on them being committed.
++
++- name: Install rustup + toolchain (user-space, no root toolchain needed)
++  ansible.builtin.shell: |
++    set -e
++    curl -sSf --proto '=https' --tlsv1.2 https://sh.rustup.rs -o /tmp/rustup-init.sh
++    sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal
++  args:
++    creates: "{{ ansible_env.HOME }}/.cargo/bin/cargo"
++
++- name: Clone the Firecracker fork
++  ansible.builtin.git:
++    repo: "{{ firecracker_repo }}"
++    dest: "{{ firecracker_src }}"
++    version: "{{ firecracker_version }}"
++    depth: 1
++    single_branch: true
++    force: false
++
++# ---- PVM forward-port: change #1 ----------------------------------------
++# Disable per-vCPU TSC scaling. PVM does not support KVM_CAP_TSC_CONTROL, so
++# the upstream call would fail and Firecracker would refuse to boot a guest.
++- name: "PVM patch: make set_tsc_khz() a no-op"
++  ansible.builtin.replace:
++    path: "{{ firecracker_src }}/src/vmm/src/arch/x86_64/vcpu.rs"
++    regexp: 'self\.fd\.set_tsc_khz\(tsc_freq\)\.map_err\(SetTscError\)'
++    replace: '{ let _ = tsc_freq; Ok(()) } // PVM: TSC scaling unsupported'
++
++# ---- PVM forward-port: change #2 ----------------------------------------
++# Relax the static-CPU-template model check so templates work across CPUs.
++# `return Err(InvalidCpuModel);` (note: no enum prefix) is unique to the live
++# code path; the test-only references use GetCpuTemplateError::InvalidCpuModel.
++- name: "PVM patch: relax static CPU-template model check"
++  ansible.builtin.replace:
++    path: "{{ firecracker_src }}/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs"
++    regexp: '^\s*return Err\(InvalidCpuModel\);'
++    replace: '                        { /* PVM: skip CPU-model compatibility check */ }'
++
++# A gnu-target build has no matching seccomp JSON, so Firecracker's build.rs
++# falls back to an empty filter automatically (no libseccomp at runtime).
++- name: Build Firecracker + jailer ({{ fc_target }}, release)
++  ansible.builtin.command:
++    cmd: cargo build --release --target {{ fc_target }} --package firecracker --package jailer
++    chdir: "{{ firecracker_src }}"
++    creates: "{{ firecracker_src }}/build/cargo_target/{{ fc_target }}/release/firecracker"
++  environment:
++    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
++    CARGO_TERM_PROGRESS_WHEN: "never"
++  async: 1800
++  poll: 20
++
++- name: Install firecracker + jailer binaries
++  ansible.builtin.copy:
++    src: "{{ firecracker_src }}/build/cargo_target/{{ fc_target }}/release/{{ item }}"
++    dest: "{{ pvm_dir }}/{{ item }}"
++    mode: "0755"
++    remote_src: true
++  loop:
++    - firecracker
++    - jailer
++
++- name: Symlink firecracker into PATH
++  ansible.builtin.file:
++    src: "{{ pvm_dir }}/firecracker"
++    dest: /usr/local/bin/firecracker
++    state: link
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/30-host-kernel.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/30-host-kernel.yml
+new file mode 100644
+index 0000000..80155e6
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/30-host-kernel.yml
+@@ -0,0 +1,71 @@
++---
++# Build + install the PVM host kernel. Based on the running distro kernel config
++# so all the cloud VM's drivers (virtio, ext4, ...) are retained, plus CONFIG_KVM_PVM.
++
++- name: Clone PVM host kernel source ({{ pvm_linux_branch }})
++  ansible.builtin.git:
++    repo: "{{ pvm_linux_repo }}"
++    dest: "{{ host_kernel_src }}"
++    version: "{{ pvm_linux_branch }}"
++    depth: 1
++    single_branch: true
++    force: false
++
++- name: Configure host kernel (running config + PVM + build fixes)
++  ansible.builtin.shell:
++    chdir: "{{ host_kernel_src }}"
++    cmd: |
++      set -euo pipefail
++      cp /boot/config-$(uname -r) .config
++      scripts/config --module   KVM_PVM
++      scripts/config --module   KVM
++      scripts/config --set-str  SYSTEM_TRUSTED_KEYS ""        # distro signing keys we don't have
++      scripts/config --set-str  SYSTEM_REVOCATION_KEYS ""
++      scripts/config --disable  MODULE_SIG_FORCE
++      scripts/config --disable  DEBUG_INFO_BTF                # speed/size; avoids pahole
++      scripts/config --disable  DEBUG_INFO_BTF_MODULES
++      scripts/config --disable  DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
++      scripts/config --enable   DEBUG_INFO_NONE
++      scripts/config --set-str  LOCALVERSION "{{ host_localversion }}"
++      scripts/config --disable  LOCALVERSION_AUTO
++      scripts/config --disable  UAPI_HEADER_TEST              # PVM's pvm_para.h fails the standalone test
++      make olddefconfig
++  args:
++    creates: "{{ host_kernel_src }}/.config"
++
++- name: Build host kernel (long-running)
++  ansible.builtin.command:
++    cmd: make -j{{ make_jobs }}
++    chdir: "{{ host_kernel_src }}"
++    creates: "{{ host_kernel_src }}/arch/x86/boot/bzImage"
++  async: 5400
++  poll: 30
++
++- name: Read built kernel release string
++  ansible.builtin.slurp:
++    src: "{{ host_kernel_src }}/include/config/kernel.release"
++  register: _krelease
++
++- name: Set pvm_kernel_release fact (e.g. 6.12.33-pvm+)
++  ansible.builtin.set_fact:
++    pvm_kernel_release: "{{ (_krelease.content | b64decode) | trim }}"
++
++- name: Install modules + image (+ dracut initramfs + BLS entry)
++  ansible.builtin.shell:
++    chdir: "{{ host_kernel_src }}"
++    cmd: |
++      set -e
++      make -j{{ make_jobs }} modules_install
++      make install
++  args:
++    creates: "/boot/vmlinuz-{{ pvm_kernel_release }}"
++
++- name: Confirm kvm-pvm module was built and installed
++  ansible.builtin.stat:
++    path: "/lib/modules/{{ pvm_kernel_release }}/kernel/arch/x86/kvm/kvm-pvm.ko"
++  register: _kvmpvm_ko
++
++- name: Assert kvm-pvm.ko present
++  ansible.builtin.assert:
++    that: _kvmpvm_ko.stat.exists
++    fail_msg: "kvm-pvm.ko not found — CONFIG_KVM_PVM did not build."
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/40-guest-kernel.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/40-guest-kernel.yml
+new file mode 100644
+index 0000000..de77b9e
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/40-guest-kernel.yml
+@@ -0,0 +1,48 @@
++---
++# Build the PVM guest kernel (a single uncompressed vmlinux ELF that Firecracker
++# boots directly). Uses a SEPARATE clone so it doesn't clash with the in-tree
++# host-kernel build objects.
++
++- name: Clone PVM guest kernel source (separate tree)
++  ansible.builtin.git:
++    repo: "{{ pvm_linux_repo }}"
++    dest: "{{ guest_kernel_src }}"
++    version: "{{ pvm_linux_branch }}"
++    depth: 1
++    single_branch: true
++    force: false
++
++- name: Download the canonical PVM guest kernel config
++  ansible.builtin.get_url:
++    url: "{{ pvm_guest_config_url }}"
++    dest: "{{ build_root }}/pvm-guest.config"
++    mode: "0644"
++
++- name: "Configure guest kernel (FC-ready virtio/ext4/serial built-in, PVM_GUEST=y)"
++  ansible.builtin.shell:
++    chdir: "{{ guest_kernel_src }}"
++    cmd: |
++      set -euo pipefail
++      cp {{ build_root }}/pvm-guest.config .config
++      scripts/config --enable   PVM_GUEST
++      scripts/config --enable   KVM_GUEST
++      scripts/config --disable  UAPI_HEADER_TEST
++      scripts/config --set-str  SYSTEM_TRUSTED_KEYS ""
++      scripts/config --set-str  SYSTEM_REVOCATION_KEYS ""
++      scripts/config --set-str  LOCALVERSION "{{ guest_localversion }}"
++      make olddefconfig
++  args:
++    creates: "{{ guest_kernel_src }}/.config"
++
++- name: Build guest vmlinux (long-running)
++  ansible.builtin.command:
++    cmd: make -j{{ make_jobs }} vmlinux
++    chdir: "{{ guest_kernel_src }}"
++    creates: "{{ guest_kernel_src }}/vmlinux"
++  async: 3600
++  poll: 30
++
++- name: Strip + install guest vmlinux
++  ansible.builtin.command:
++    cmd: objcopy --strip-debug "{{ guest_kernel_src }}/vmlinux" "{{ pvm_dir }}/vmlinux-pvm"
++    creates: "{{ pvm_dir }}/vmlinux-pvm"
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/50-rootfs.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/50-rootfs.yml
+new file mode 100644
+index 0000000..b9031f5
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/50-rootfs.yml
+@@ -0,0 +1,28 @@
++---
++# Build an ext4 rootfs for the microVM from the Firecracker CI Ubuntu image,
++# with an SSH key injected so the smoke test can log in.
++
++- name: Download Ubuntu rootfs (squashfs)
++  ansible.builtin.get_url:
++    url: "{{ rootfs_squashfs_url }}"
++    dest: "{{ build_root }}/rootfs.squashfs"
++    mode: "0644"
++
++- name: Generate guest SSH keypair
++  ansible.builtin.command:
++    cmd: ssh-keygen -t ed25519 -N "" -f "{{ pvm_dir }}/id_rsa"
++    creates: "{{ pvm_dir }}/id_rsa"
++
++- name: Build ext4 rootfs with the key injected
++  ansible.builtin.shell:
++    cmd: |
++      set -euo pipefail
++      rm -rf "{{ build_root }}/squashfs-root"
++      unsquashfs -q -d "{{ build_root }}/squashfs-root" "{{ build_root }}/rootfs.squashfs"
++      mkdir -p "{{ build_root }}/squashfs-root/root/.ssh"
++      cp "{{ pvm_dir }}/id_rsa.pub" "{{ build_root }}/squashfs-root/root/.ssh/authorized_keys"
++      chown -R root:root "{{ build_root }}/squashfs-root"
++      truncate -s {{ rootfs_size }} "{{ pvm_dir }}/rootfs.ext4"
++      mkfs.ext4 -q -F -d "{{ build_root }}/squashfs-root" "{{ pvm_dir }}/rootfs.ext4"
++  args:
++    creates: "{{ pvm_dir }}/rootfs.ext4"
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/60-boot.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/60-boot.yml
+new file mode 100644
+index 0000000..21fd8de
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/60-boot.yml
+@@ -0,0 +1,65 @@
++---
++# Configure GRUB + module loading and (optionally) reboot into the PVM kernel.
++
++- name: Read current PVM kernel boot args
++  ansible.builtin.command: "grubby --info=/boot/vmlinuz-{{ pvm_kernel_release }}"
++  register: _grubinfo
++  changed_when: false
++
++- name: Ensure pti=off on the PVM kernel (PVM is incompatible with page-table isolation)
++  ansible.builtin.command: "grubby --update-kernel=/boot/vmlinuz-{{ pvm_kernel_release }} --args=pti=off"
++  when: "'pti=off' not in _grubinfo.stdout"
++
++- name: Auto-load kvm-pvm at boot
++  ansible.builtin.copy:
++    dest: /etc/modules-load.d/kvm-pvm.conf
++    content: "kvm-pvm\n"
++    mode: "0644"
++
++- name: Blacklist vendor KVM modules (cannot coexist with kvm-pvm)
++  ansible.builtin.copy:
++    dest: /etc/modprobe.d/blacklist-kvm-vendor.conf
++    content: "blacklist kvm_amd\nblacklist kvm_intel\n"
++    mode: "0644"
++
++- name: Make the PVM kernel the default boot entry
++  ansible.builtin.command: "grubby --set-default=/boot/vmlinuz-{{ pvm_kernel_release }}"
++  when: pvm_set_default_kernel | bool
++  changed_when: true
++
++- name: Reboot into the PVM kernel
++  ansible.builtin.reboot:
++    reboot_timeout: 900
++    msg: "Rebooting into PVM kernel {{ pvm_kernel_release }}"
++  when: pvm_reboot | bool
++
++# ---- post-reboot verification ----
++- name: Confirm we are running the PVM kernel
++  ansible.builtin.command: uname -r
++  register: _unr
++  changed_when: false
++  when: pvm_reboot | bool
++
++- name: Assert running kernel == built PVM kernel
++  ansible.builtin.assert:
++    that: _unr.stdout == pvm_kernel_release
++    fail_msg: "Booted '{{ _unr.stdout }}', expected '{{ pvm_kernel_release }}'. Check GRUB default / console."
++  when: pvm_reboot | bool
++
++- name: Load kvm-pvm now
++  ansible.builtin.command: modprobe kvm-pvm
++  changed_when: false
++  when: pvm_reboot | bool
++
++- name: Check /dev/kvm (the PVM software interface)
++  ansible.builtin.stat:
++    path: /dev/kvm
++  register: _devkvm
++  when: pvm_reboot | bool
++
++- name: Assert /dev/kvm exists — PVM is active
++  ansible.builtin.assert:
++    that: _devkvm.stat.exists
++    success_msg: "PVM active: /dev/kvm present on {{ pvm_kernel_release }}."
++    fail_msg: "kvm-pvm did not create /dev/kvm. Check `dmesg | grep -i pvm` (FSGSBASE?)."
++  when: pvm_reboot | bool
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/70-smoke-test.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/70-smoke-test.yml
+new file mode 100644
+index 0000000..e4fa08c
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/70-smoke-test.yml
+@@ -0,0 +1,43 @@
++---
++# End-to-end proof: boot a Firecracker microVM via PVM (no KVM hardware) and
++# verify the guest is reachable + SSH-able.
++
++- name: Check /dev/kvm is available for the test
++  ansible.builtin.stat:
++    path: /dev/kvm
++  register: _devkvm_test
++
++- name: Skip smoke test when /dev/kvm is absent
++  ansible.builtin.debug:
++    msg: "Skipping smoke test: /dev/kvm not present (did you run with pvm_reboot=false?)."
++  when: not _devkvm_test.stat.exists
++
++- name: Run microVM smoke test
++  when: _devkvm_test.stat.exists
++  block:
++    - name: Render microVM config
++      ansible.builtin.template:
++        src: vmconfig.json.j2
++        dest: "{{ pvm_dir }}/vmconfig.json"
++        mode: "0644"
++
++    - name: Render run-test script
++      ansible.builtin.template:
++        src: run-test.sh.j2
++        dest: "{{ pvm_dir }}/run-test.sh"
++        mode: "0755"
++
++    - name: Execute end-to-end microVM test
++      ansible.builtin.command: "{{ pvm_dir }}/run-test.sh"
++      register: _smoke
++      changed_when: false
++
++    - name: Show smoke-test result
++      ansible.builtin.debug:
++        var: _smoke.stdout_lines
++
++    - name: Assert the guest booted and was reachable
++      ansible.builtin.assert:
++        that: "'RESULT_GUEST_UP=1' in _smoke.stdout"
++        success_msg: "microVM booted via PVM and the guest is reachable. 🎉"
++        fail_msg: "microVM did not come up — see the smoke-test output above."
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/main.yml b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/main.yml
+new file mode 100644
+index 0000000..ee15716
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/tasks/main.yml
+@@ -0,0 +1,25 @@
++---
++- import_tasks: 00-preflight.yml
++  tags: [always, preflight]
++
++- import_tasks: 10-packages.yml
++  tags: [packages]
++
++- import_tasks: 20-firecracker.yml
++  tags: [firecracker]
++
++- import_tasks: 30-host-kernel.yml
++  tags: [host_kernel]
++
++- import_tasks: 40-guest-kernel.yml
++  tags: [guest_kernel]
++
++- import_tasks: 50-rootfs.yml
++  tags: [rootfs]
++
++- import_tasks: 60-boot.yml
++  tags: [boot]
++
++- import_tasks: 70-smoke-test.yml
++  tags: [smoke_test]
++  when: pvm_run_smoke_test | bool
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/templates/run-test.sh.j2 b/pvm-firecracker-ansible/roles/pvm_firecracker/templates/run-test.sh.j2
+new file mode 100644
+index 0000000..b619557
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/templates/run-test.sh.j2
+@@ -0,0 +1,41 @@
++#!/bin/bash
++# {{ ansible_managed }}
++# Boot a Firecracker microVM via PVM and prove the guest is up.
++set -u
++GUEST="{{ vm_guest_ip }}"; TAP="{{ vm_tap_dev }}"
++FCBIN="{{ pvm_dir }}/firecracker"; KEY="{{ pvm_dir }}/id_rsa"
++
++echo "host kernel: $(uname -r)"
++modprobe kvm-pvm 2>/dev/null
++if [ ! -e /dev/kvm ]; then echo "RESULT_DEVKVM=MISSING"; exit 1; fi
++echo "RESULT_DEVKVM=PRESENT"
++
++# host tap networking
++ip link del "$TAP" 2>/dev/null || true
++ip tuntap add dev "$TAP" mode tap
++ip addr add {{ vm_host_ip }}/24 dev "$TAP"
++ip link set "$TAP" up
++echo 1 > /proc/sys/net/ipv4/ip_forward
++iptables -P FORWARD ACCEPT 2>/dev/null || true
++chmod 600 "$KEY"
++
++cd "{{ pvm_dir }}"
++rm -f /tmp/fc.sock fc-console.log
++setsid "$FCBIN" --api-sock /tmp/fc.sock --config-file "{{ pvm_dir }}/vmconfig.json" \
++    >"{{ pvm_dir }}/fc-console.log" 2>&1 </dev/null &
++FCPID=$!
++
++UP=0
++for i in $(seq 1 30); do
++  sleep 2
++  if ping -c1 -W1 "$GUEST" >/dev/null 2>&1; then UP=1; echo "guest up after $((i*2))s"; break; fi
++  kill -0 "$FCPID" 2>/dev/null || { echo "firecracker exited early"; break; }
++done
++
++if [ "$UP" = 1 ]; then
++  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 \
++      -i "$KEY" root@"$GUEST" 'echo GUEST_UNAME=$(uname -a); echo GUEST_BOOT_OK=1' 2>&1
++fi
++echo "RESULT_GUEST_UP=$UP"
++tail -20 "{{ pvm_dir }}/fc-console.log"
++kill "$FCPID" 2>/dev/null || true
+diff --git a/pvm-firecracker-ansible/roles/pvm_firecracker/templates/vmconfig.json.j2 b/pvm-firecracker-ansible/roles/pvm_firecracker/templates/vmconfig.json.j2
+new file mode 100644
+index 0000000..a9a3426
+--- /dev/null
++++ b/pvm-firecracker-ansible/roles/pvm_firecracker/templates/vmconfig.json.j2
+@@ -0,0 +1,25 @@
++{
++  "boot-source": {
++    "kernel_image_path": "{{ pvm_dir }}/vmlinux-pvm",
++    "boot_args": "console=ttyS0 reboot=k panic=1"
++  },
++  "drives": [
++    {
++      "drive_id": "rootfs",
++      "path_on_host": "{{ pvm_dir }}/rootfs.ext4",
++      "is_root_device": true,
++      "is_read_only": false
++    }
++  ],
++  "network-interfaces": [
++    {
++      "iface_id": "net1",
++      "guest_mac": "{{ vm_guest_mac }}",
++      "host_dev_name": "{{ vm_tap_dev }}"
++    }
++  ],
++  "machine-config": {
++    "vcpu_count": {{ vm_vcpus }},
++    "mem_size_mib": {{ vm_mem_mib }}
++  }
++}
+-- 
+2.52.0
+

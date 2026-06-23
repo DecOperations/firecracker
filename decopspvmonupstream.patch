@@ -1,0 +1,77 @@
+From 4beefbc94ff7a353ab43b4389ec892563d176787 Mon Sep 17 00:00:00 2001
+From: PVM Forward-Port <pvm@local>
+Date: Tue, 23 Jun 2026 15:01:44 +0800
+Subject: [PATCH] PVM forward-port: preserve loopholelabs PVM changes on modern
+ upstream
+
+Re-applies the loopholelabs (PVM / no-KVM Firecracker) source changes on top
+of a current upstream Firecracker checkout, so the fork can be updated to the
+latest upstream WITHOUT hand-merging or losing the PVM behaviour.
+
+Two changes are required; everything else PVM needs is already satisfied by
+modern upstream (see notes at the bottom of this patch):
+
+1. vcpu.rs - make set_tsc_khz() a no-op.
+   PVM does not support KVM TSC scaling (KVM_SET_TSC_KHZ). Upstream calls it
+   unconditionally on snapshot restore, which fails / can freeze the guest on
+   PVM. We drop the ioctl and return Ok(()).
+
+2. custom_cpu_template.rs - relax the static CPU-template model check.
+   The PVM vCPU does not match the host CPU model table, so the strict
+   InvalidCpuModel guard rejects templates like T2A. We disable just that
+   check (the vendor check is kept).
+
+Apply with either:
+    git apply pvm-forward-port.patch        # just the working-tree changes
+    git am    pvm-forward-port.patch        # as a commit (preserves this message)
+
+If upstream context has drifted, fall back to a fuzzy apply:
+    git apply --3way pvm-forward-port.patch
+    # or:  patch -p1 --fuzz=3 < pvm-forward-port.patch
+
+NOTE on MSRs: the fork also added explicit PVM MSR entries in msr.rs. Modern
+upstream replaced the hand-listed MSR allow-list with a RANGE-based
+serialization scheme that already covers the PVM MSR range, so no msr.rs change
+is needed on current upstream. If you target an older upstream that still uses
+the explicit list, add the PVM MSRs (0x4b564d00..=0x4b564dff region) there too.
+---
+ src/vmm/src/arch/x86_64/vcpu.rs                      | 8 ++++++--
+ src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs | 3 ++-
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/vmm/src/arch/x86_64/vcpu.rs b/src/vmm/src/arch/x86_64/vcpu.rs
+index 98563aab2..5e4c84636 100644
+--- a/src/vmm/src/arch/x86_64/vcpu.rs
++++ b/src/vmm/src/arch/x86_64/vcpu.rs
+@@ -640,8 +640,12 @@ impl KvmVcpu {
+     }
+ 
+     /// Scale the TSC frequency of this vCPU to the one provided as a parameter.
+-    pub fn set_tsc_khz(&self, tsc_freq: u32) -> Result<(), SetTscError> {
+-        self.fd.set_tsc_khz(tsc_freq).map_err(SetTscError)
++    pub fn set_tsc_khz(&self, _: u32) -> Result<(), SetTscError> {
++        // Disable TSC scaling when using PVM because it is unsupported on most virtualized platforms.
++        // Even on supported platforms like virtualized AMD CPUs, enabling TSC scaling can cause VM freezes
++        // after resuming from a snapshot.
++        // For more details, see https://github.com/virt-pvm/linux/issues/12#issue-2515360332
++        Ok(())
+     }
+ 
+     /// Use provided state to populate KVM internal state.
+diff --git a/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs b/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs
+index 1e790f1a9..f01a0a2a8 100644
+--- a/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs
++++ b/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs
+@@ -39,7 +39,8 @@ impl GetCpuTemplate for Option<CpuTemplateType> {
+ 
+                     let cpu_model = CpuModel::get_cpu_model();
+                     if !template.get_supported_cpu_models().contains(&cpu_model) {
+-                        return Err(InvalidCpuModel);
++                        // Disable the CPU compatibility check to allow using templates like T2A on more modern CPUs
++                        // return Err(InvalidCpuModel);
+                     }
+ 
+                     match template {
+-- 
+2.52.0
+
