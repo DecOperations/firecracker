@@ -114,6 +114,31 @@ impl Bars {
         self.bars[(bar_idx + 1) as usize].encoded_addr = addr_hi;
         self.bars[(bar_idx + 1) as usize].encoded_size = size_hi;
     }
+    /// Set a single BAR slot as a 32-bit memory BAR. Used by VFIO passthrough for devices that
+    /// expose 32-bit BARs (virtio-PCI only ever uses [`Self::set_bar_64`]).
+    pub fn set_bar_32(&mut self, bar_idx: u8, addr: u64, size: u64, prefetchable: BarPrefetchable) {
+        assert_ne!(size, 0);
+        assert!(size.is_power_of_two());
+        assert!(addr & 0b1111 == 0);
+        assert!(addr.checked_add(size - 1).unwrap() <= u64::from(u32::MAX));
+        assert!(bar_idx < NUM_BAR_REGS);
+        assert_eq!(self.bars[bar_idx as usize].encoded_addr, 0);
+        assert_eq!(self.bars[bar_idx as usize].encoded_size, 0);
+
+        let addr_lo = (addr & 0xffff_fff0) as u32;
+        let prefetchable = (prefetchable as u32) << 3;
+        // Memory space indicator = 0, type bits 2:1 = 00 (32-bit).
+        self.bars[bar_idx as usize].encoded_addr = addr_lo | prefetchable;
+        // 32-bit size encoding: low 4 bits are flags, so the writable size mask is `!(size - 1)`.
+        self.bars[bar_idx as usize].encoded_size = !(size as u32 - 1);
+    }
+
+    /// Get the address of a 32bit bar
+    pub fn get_bar_addr_32(&self, bar_idx: u8) -> u64 {
+        assert!(bar_idx < NUM_BAR_REGS);
+        u64::from(self.bars[bar_idx as usize].encoded_addr & !0b1111)
+    }
+
     /// Get the address of the 64bit bar
     pub fn get_bar_addr_64(&self, bar_idx: u8) -> u64 {
         assert!(bar_idx < NUM_BAR_REGS - 1);

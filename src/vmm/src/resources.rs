@@ -31,6 +31,7 @@ use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::*;
 use crate::vmm_config::pmem::{PmemBuilder, PmemConfig, PmemConfigError};
 use crate::vmm_config::serial::SerialConfig;
+use crate::vmm_config::vfio::{VfioBuilder, VfioConfigError, VfioDeviceConfig};
 use crate::vmm_config::vsock::*;
 use crate::vstate::memory;
 use crate::vstate::memory::{GuestRegionMmap, MemoryError};
@@ -120,6 +121,8 @@ pub struct VmResources {
     pub net_builder: NetBuilder,
     /// The entropy device builder.
     pub entropy: EntropyDeviceBuilder,
+    /// The VFIO passthrough devices builder.
+    pub vfio: VfioBuilder,
     /// The pmem device configs.
     pub pmem: PmemBuilder,
     /// The memory hotplug configuration.
@@ -364,6 +367,17 @@ impl VmResources {
     ) -> Result<(), DriveError> {
         let has_pmem_root = self.pmem.has_root_device();
         self.block.insert(block_device_config, has_pmem_root)
+    }
+
+    /// Inserts a VFIO passthrough device config to be attached when the VM starts.
+    pub fn build_vfio_device(
+        &mut self,
+        body: VfioDeviceConfig,
+    ) -> Result<(), VfioConfigError> {
+        if !self.pci_enabled {
+            return Err(VfioConfigError::PciDisabled);
+        }
+        self.vfio.insert(body)
     }
 
     /// Builds a network device to be attached when the VM starts.
@@ -660,6 +674,7 @@ mod tests {
             boot_timer: false,
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
             entropy: Default::default(),
+            vfio: Default::default(),
             pmem: Default::default(),
             pci_enabled: false,
             serial_out_path: None,

@@ -34,6 +34,13 @@ const DEV_KVM: &CStr = c"/dev/kvm";
 const DEV_KVM_MAJOR: u32 = 10;
 const DEV_KVM_MINOR: u32 = 232;
 
+// VFIO container device (`/dev/vfio/vfio`) is a misc char device (major 10); its minor is
+// dynamically allocated and discovered from /proc/misc, exactly like /dev/userfaultfd. The
+// per-IOMMU-group node (`/dev/vfio/<N>`) has a dynamically-allocated *major*/minor and still needs
+// a `--vfio-group` CLI argument to be replicated into the jail — see docs/vfio-passthrough-plan.md.
+const DEV_VFIO_VFIO: &CStr = c"/dev/vfio/vfio";
+const DEV_VFIO_MAJOR: u32 = 10;
+
 // TUN/TAP device minor/major numbers are taken from
 // www.kernel.org/doc/Documentation/networking/tuntap.txt
 const DEV_NET_TUN: &CStr = c"/dev/net/tun";
@@ -62,7 +69,7 @@ const DEV_UFFD_MAJOR: u32 = 10;
 // We need /run for the default location of the api socket.
 // Since libc::chown is not recursive, we cannot specify only /dev/net as we want
 // to walk through the entire folder hierarchy.
-const FOLDER_HIERARCHY: [&str; 4] = ["/", "/dev", "/dev/net", "/run"];
+const FOLDER_HIERARCHY: [&str; 5] = ["/", "/dev", "/dev/net", "/dev/vfio", "/run"];
 const FOLDER_PERMISSIONS: u32 = 0o700;
 
 // When running with `--new-pid-ns` flag, the PID of the process running the exec_file differs
@@ -131,6 +138,7 @@ pub struct Env {
     cgroup_conf: Option<CgroupConfiguration>,
     resource_limits: ResourceLimits,
     uffd_dev_minor: Option<u32>,
+    vfio_container_minor: Option<u32>,
 }
 
 impl Env {
@@ -253,6 +261,7 @@ impl Env {
         }
 
         let uffd_dev_minor = Self::get_userfaultfd_minor_dev_number().ok();
+        let vfio_container_minor = Self::get_misc_minor_dev_number("vfio").ok();
 
         Ok(Env {
             id: id.to_owned(),
@@ -270,6 +279,7 @@ impl Env {
             cgroup_conf,
             resource_limits,
             uffd_dev_minor,
+            vfio_container_minor,
         })
     }
 
@@ -403,6 +413,12 @@ impl Env {
     }
 
     fn get_userfaultfd_minor_dev_number() -> Result<u32, UserfaultfdParseError> {
+        Self::get_misc_minor_dev_number("userfaultfd")
+    }
+
+    /// Look up the dynamically-allocated minor number of a misc (major 10) character device by
+    /// name in `/proc/misc`. Used for both `userfaultfd` and the VFIO container `vfio`.
+    fn get_misc_minor_dev_number(name: &str) -> Result<u32, UserfaultfdParseError> {
         let buf = read_to_string("/proc/misc")?;
 
         for line in buf.lines() {
@@ -411,7 +427,7 @@ impl Env {
                 continue;
             }
 
-            if dev[1] == "userfaultfd" {
+            if dev[1] == name {
                 return Ok(dev[0].parse::<u32>()?);
             }
         }
@@ -705,6 +721,19 @@ impl Env {
         // Expose the device in the jailed environment.
         if let Some(minor) = self.uffd_dev_minor {
             self.mknod_and_own_dev(DEV_UFFD_PATH, DEV_UFFD_MAJOR, minor)?;
+        }
+
+        // If the host has the VFIO container device (`/dev/vfio/vfio`), expose it in the jail so a
+        // VFIO passthrough device can open a container. Best-effort: absence just means no VFIO.
+        // NOTE: the per-IOMMU-group node `/dev/vfio/<N>` still needs to be replicated too (it has a
+        // dynamically-allocated major/minor); that requires a `--vfio-group` CLI argument and is
+        // tracked as a follow-up — see docs/vfio-passthrough-plan.md (Milestone 0, task 3).
+        if let Some(minor) = self.vfio_container_minor {
+            let _ = self
+                .mknod_and_own_dev(DEV_VFIO_VFIO, DEV_VFIO_MAJOR, minor)
+                .map_err(|err| {
+                    println!("Warning! Could not create /dev/vfio/vfio inside jailer: {err}.");
+                });
         }
 
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;

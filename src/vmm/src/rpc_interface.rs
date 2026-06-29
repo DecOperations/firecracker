@@ -45,6 +45,7 @@ use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfi
 use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
+use crate::vmm_config::vfio::VfioDeviceConfig;
 use crate::vmm_config::{self, RateLimiterUpdate};
 
 /// This enum represents the public interface of the VMM. Each action contains various
@@ -92,6 +93,8 @@ pub enum VmmAction {
     /// `NetworkInterfaceConfig` as input. This action can only be called before the microVM has
     /// booted.
     InsertNetworkDevice(NetworkInterfaceConfig),
+    /// Add a VFIO PCIe passthrough device (e.g. an SR-IOV VF). Pre-boot only; requires PCI enabled.
+    InsertVfioDevice(VfioDeviceConfig),
     /// Load the microVM state using as input the `LoadSnapshotParams`. This action can only be
     /// called before the microVM has booted. If this action is successful, the loaded microVM will
     /// be in `Paused` state. Should change this state to `Resumed` for the microVM to run.
@@ -198,6 +201,8 @@ pub enum VmmActionError {
     MmdsLimitExceeded(data_store::MmdsDatastoreError),
     /// Network config error: {0}
     NetworkConfig(#[from] NetworkInterfaceError),
+    /// VFIO config error: {0}
+    VfioConfig(#[from] crate::vmm_config::vfio::VfioConfigError),
     /// The requested operation is not supported: {0}
     NotSupported(String),
     /// The requested operation is not supported after starting the microVM.
@@ -474,6 +479,7 @@ impl<'a> PrebootApiController<'a> {
             InsertBlockDevice(config) => self.insert_block_device(config),
             InsertPmemDevice(config) => self.insert_pmem_device(config),
             InsertNetworkDevice(config) => self.insert_net_device(config),
+            InsertVfioDevice(config) => self.insert_vfio_device(config),
             LoadSnapshot(config) => self
                 .load_snapshot(&config)
                 .map_err(VmmActionError::LoadSnapshot),
@@ -546,6 +552,17 @@ impl<'a> PrebootApiController<'a> {
             .build_net_device(cfg)
             .map(|()| VmmData::Empty)
             .map_err(VmmActionError::NetworkConfig)
+    }
+
+    fn insert_vfio_device(
+        &mut self,
+        cfg: VfioDeviceConfig,
+    ) -> Result<VmmData, VmmActionError> {
+        self.boot_path = true;
+        self.vm_resources
+            .build_vfio_device(cfg)
+            .map(|()| VmmData::Empty)
+            .map_err(VmmActionError::VfioConfig)
     }
 
     fn insert_pmem_device(&mut self, cfg: PmemConfig) -> Result<VmmData, VmmActionError> {
@@ -846,6 +863,7 @@ impl RuntimeApiController {
                 .map_err(VmmActionError::MemoryHotplugUpdate),
             // Operations not allowed post-boot.
             ConfigureBootSource(_)
+            | InsertVfioDevice(_)
             | ConfigureLogger(_)
             | ConfigureMetrics(_)
             | ConfigureSerial(_)

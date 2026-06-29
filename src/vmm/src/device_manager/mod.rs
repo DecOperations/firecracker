@@ -306,6 +306,26 @@ impl DeviceManager {
         Ok(())
     }
 
+    /// Attaches a real PCI function (e.g. an SR-IOV VF) to the guest via VFIO passthrough.
+    /// Requires PCI to be enabled.
+    pub(crate) fn attach_vfio_device(
+        &mut self,
+        vm: &Vm,
+        id: String,
+        sysfs_path: &str,
+    ) -> Result<(), AttachDeviceError> {
+        let kvm_vm = vm
+            .as_kvm()
+            .cloned()
+            .ok_or(AttachDeviceError::NotSupported)?;
+        if !self.is_pci_enabled() {
+            return Err(AttachDeviceError::NotSupported);
+        }
+        self.pci_devices
+            .attach_pci_vfio_device(&kvm_vm, id, sysfs_path)?;
+        Ok(())
+    }
+
     /// Attaches a [`BootTimer`] to the VM
     pub(crate) fn attach_boot_timer_device(
         &mut self,

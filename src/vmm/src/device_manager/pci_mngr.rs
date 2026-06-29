@@ -13,6 +13,7 @@ use super::persist::MmdsState;
 use crate::EventManager;
 use crate::device_manager::DevicePersistError;
 use crate::devices::pci::PciSegment;
+use crate::devices::vfio::VfioPciDevice;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
 use crate::devices::virtio::block::device::Block;
@@ -50,6 +51,8 @@ pub struct PciDevices {
     pub pci_segment: Option<PciSegment>,
     /// All VirtIO PCI devices of the system
     pub virtio_devices: HashMap<VirtioDeviceId, Arc<Mutex<VirtioPciDevice>>>,
+    /// All VFIO passthrough PCI devices of the system, keyed by device id.
+    pub vfio_devices: HashMap<String, Arc<Mutex<VfioPciDevice>>>,
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -66,6 +69,8 @@ pub enum PciManagerError {
     VirtioPciDevice(#[from] VirtioPciDeviceError),
     /// KVM error: {0}
     Kvm(#[from] vmm_sys_util::errno::Error),
+    /// VFIO passthrough device error: {0}
+    Vfio(#[from] crate::devices::vfio::VfioPciError),
 }
 
 impl PciDevices {
@@ -172,6 +177,56 @@ impl PciDevices {
         let virtio_device = Arc::new(Mutex::new(virtio_device));
 
         self.attach_common(vm, device_type, id, sbdf, virtio_device, event_manager)
+    }
+
+    /// Attaches a real PCI function (e.g. an SR-IOV VF) to the guest via VFIO passthrough.
+    ///
+    /// Opens/Resets the VFIO device, places its BARs, DMA-maps guest memory, registers its config
+    /// space on the PCI bus and its BAR windows on the system MMIO bus. MSI-X routing is wired up
+    /// in a follow-up step (the device exposes [`VfioPciDevice::enable_msix`]).
+    pub(crate) fn attach_pci_vfio_device(
+        &mut self,
+        vm: &Arc<KvmVm>,
+        id: String,
+        sysfs_path: &str,
+    ) -> Result<(), PciManagerError> {
+        let pci_segment = self.pci_segment.as_ref().unwrap();
+        let sbdf = pci_segment.next_device_sbdf()?;
+        debug!("Allocating SBDF: {sbdf:?} for VFIO device {id}");
+
+        let mem = vm.guest_memory().clone();
+
+        let device = {
+            let mut resource_allocator_lock = vm.resource_allocator();
+            let resource_allocator = resource_allocator_lock.deref_mut();
+            VfioPciDevice::new(id.clone(), sysfs_path, &mem, resource_allocator)?
+        };
+
+        let device = Arc::new(Mutex::new(device));
+
+        // Register the device's BAR windows on the system MMIO bus so guest MMIO reaches the
+        // passed-through hardware.
+        {
+            let dev = device.lock().expect("Poisoned lock");
+            for bar in dev.bars() {
+                debug!(
+                    "Inserting VFIO BAR{} window: {:#x}:{:#x}",
+                    bar.index, bar.gpa, bar.size
+                );
+                vm.common.mmio_bus.insert(device.clone(), bar.gpa, bar.size)?;
+            }
+        }
+
+        // Register the device's config space on the PCI bus.
+        pci_segment
+            .pci_bus
+            .lock()
+            .expect("Poisoned lock")
+            .add_device(sbdf.device(), device.clone())?;
+
+        self.vfio_devices.insert(id, device);
+
+        Ok(())
     }
 
     fn restore_pci_device<T: 'static + VirtioDevice + MutEventSubscriber + Debug>(
